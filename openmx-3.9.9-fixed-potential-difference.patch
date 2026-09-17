@@ -1,0 +1,358 @@
+diff --git a/source/DFT.c b/source/DFT.c
+index 789bc8b..2f9be99 100755
+--- a/source/DFT.c
++++ b/source/DFT.c
+@@ -176,6 +176,7 @@ double DFT(int MD_iter, int Cnt_Now)
+ 
+   Allocate_Free_GridData(1);
+   if (Cnt_switch==1) Allocate_Free_OrbOpt(1);
++  if (PotentialConstraintDFT) PotentialConstraint_Init();
+ 
+   /****************************************************
+     print some informations to the standard output
+@@ -256,6 +257,7 @@ double DFT(int MD_iter, int Cnt_Now)
+   }
+   else{
+     SCF_MAX = DFTSCF_loop;
++    if (PotentialConstraintDFT) SCF_MAX = 2*DFTSCF_loop;
+   }
+   
+   orbitalOpt_iter = 1;
+@@ -907,6 +909,7 @@ double DFT(int MD_iter, int Cnt_Now)
+     *****************************************************/
+ 
+     time14 += Mulliken_Charge("stdout");
++    if (PotentialConstraintDFT) PotentialConstraint_Update(SCF_iter);
+ 
+     /*****************************************************
+                     check SCF-convergence 
+@@ -926,9 +929,18 @@ double DFT(int MD_iter, int Cnt_Now)
+     if (
+ 	2<=SCF_iter &&        
+ 	((dUele<SCF_Criterion && NormRD[0]<(10*SCF_Criterion) && Cnt_switch==0)   ||
++	 (dUele<SCF_Criterion && PotentialConstraintDFT)  ||
+ 	 (dUele<SCF_Criterion && Cnt_switch==1 && Cnt_Now!=1)                     ||
+ 	 (dUele<SCF_Criterion && Cnt_switch==1 && Cnt_Now==1 && OrbOpt_end==1))
+-	) po = 1;
++	){
++      if (PotentialConstraintDFT && !PotentialConstraintReferenceSet){
++        PotentialConstraint_SetReference(SCF_iter);
++      }
++      else if (!PotentialConstraintDFT ||
++               PotentialConstraintReferenceIter+3<=SCF_iter){
++        po = 1;
++      }
++    }
+ 
+     /*****************************************************
+                      orbital optimization
+@@ -1270,7 +1282,10 @@ double DFT(int MD_iter, int Cnt_Now)
+     **************************************************************/
+ 
+     Read_SCF_keywords();
+-    if (Cnt_switch==0) SCF_MAX = DFTSCF_loop;
++    if (Cnt_switch==0){
++      SCF_MAX = DFTSCF_loop;
++      if (PotentialConstraintDFT) SCF_MAX = 2*DFTSCF_loop;
++    }
+ 
+     /************************************************************************
+                               end of SCF calculation
+@@ -1368,6 +1383,7 @@ double DFT(int MD_iter, int Cnt_Now)
+   *******************************************************************/
+ 
+   time14 += Mulliken_Charge("write");
++  if (PotentialConstraintDFT) PotentialConstraint_FinalOutput();
+ 
+   /*******************************************************************
+             save occupation number in LDA+U
+diff --git a/source/Input_std.c b/source/Input_std.c
+index 76adedb..7147154 100755
+--- a/source/Input_std.c
++++ b/source/Input_std.c
+@@ -100,6 +100,13 @@ void Input_std(char *file)
+   input_string("DATA.PATH",DFT_DATA_PATH,"../DFT_DATA19");
+   input_int("level.of.stdout", &level_stdout,1);
+   input_int("level.of.fileout",&level_fileout,1);
++  input_logical("Potential.ConstraintDFT",&PotentialConstraintDFT,0);
++  input_double("Potential.Constraint.Vc",&PotentialConstraintVc,0.0);
++  input_logical("Potential.Constraint.Output",&PotentialConstraintOutput,1);
++  if (myid==Host_ID && PotentialConstraintDFT){
++    printf("<PotentialConstraintInput> fixed difference Vc=%15.8f eV (left=+Vc/2, right=-Vc/2)\n",
++           PotentialConstraintVc);
++  }
+   input_logical("memory.usage.fileout",&memoryusage_fileout,0); /* default=off */
+   input_logical("monitoring.memory.usage",&monitoring_memory_usage,0); /* default=off */
+ 
+@@ -744,6 +751,10 @@ void Input_std(char *file)
+   i_vec[9]=10; i_vec[10]=11; i_vec[11]=12;
+ 
+   input_string2int("scf.EigenvalueSolver", &Solver, 12, s_vec,i_vec);
++  if (PotentialConstraintDFT && Solver==4){
++    printf("Potential.ConstraintDFT is not supported with NEGF in this MVP.\n");
++    po++;
++  }
+ 
+   if (Solver==11 || Solver==12){
+     LNO_flag = 1;
+@@ -1446,6 +1457,9 @@ void Input_std(char *file)
+     /* memory allocation */
+     Allocate_Arrays(1);
+ 
++    PotentialConstraintGroup = (int*)malloc(sizeof(int)*(atomnum+1));
++    for (i=0; i<=atomnum; i++) PotentialConstraintGroup[i] = 0;
++
+     /* initialize */
+ 
+     s_vec[0]="Ang";  s_vec[1]="AU";   s_vec[2]="FRAC";
+@@ -1566,6 +1580,43 @@ void Input_std(char *file)
+ 
+     }
+ 
++    if (PotentialConstraintDFT){
++      int nleft=0,nright=0,nread=0,atom_index,group;
++
++      if (fp=input_find("<Potential.Constraint")){
++        while (fgets(buf,MAXBUF,fp)!=NULL){
++          if (strstr(buf,"Potential.Constraint>")!=NULL) break;
++          if (sscanf(buf,"%d %d",&atom_index,&group)==2){
++            if (atom_index<1 || atomnum<atom_index || group<0 || 2<group){
++              printf("Invalid entry in <Potential.Constraint: %d %d\n",atom_index,group);
++              po++;
++            }
++            else{
++              PotentialConstraintGroup[atom_index] = group;
++              nread++;
++            }
++          }
++        }
++        if (feof(fp)){
++          printf("Potential.Constraint> is missing.\n");
++          po++;
++        }
++      }
++      else{
++        printf("Potential.ConstraintDFT is on, but <Potential.Constraint is missing.\n");
++        po++;
++      }
++
++      for (i=1; i<=atomnum; i++){
++        if (PotentialConstraintGroup[i]==1) nleft++;
++        if (PotentialConstraintGroup[i]==2) nright++;
++      }
++      if (nread==0 || nleft==0 || nright==0){
++        printf("Potential.Constraint requires at least one atom in each of groups 1 and 2.\n");
++        po++;
++      }
++    }
++
+     /****************************************************
+        the unit of atomic coordinates is transformed 
+     ****************************************************/
+@@ -6123,9 +6174,3 @@ void Get_Rotational_Matrix(double alpha, double beta, double gamma, int L, doubl
+   }
+ 
+ } /* end of Get_Rotational_Matrix */
+-
+-
+-
+-
+-
+-
+diff --git b/source/Potential_Constraint.c b/source/Potential_Constraint.c
+new file mode 100644
+index 0000000..8ba95f0
+--- /dev/null
++++ b/source/Potential_Constraint.c
+@@ -0,0 +1,96 @@
++/**********************************************************************
++  Potential_Constraint.c
++
++  Minimal two-electrode fixed potential-difference implementation.
++***********************************************************************/
++
++#include <stdio.h>
++#include "openmx_common.h"
++#include "mpi.h"
++
++static void electrode_populations(double *nl, double *nr)
++{
++  int i,myid;
++  double left=0.0,right=0.0,data[2];
++
++  MPI_Comm_rank(mpi_comm_level1,&myid);
++  if (myid==Host_ID){
++    for (i=1; i<=atomnum; i++){
++      double n;
++      if (SpinP_switch==0) n = 2.0*InitN_USpin[i];
++      else                 n = InitN_USpin[i] + InitN_DSpin[i];
++      if      (PotentialConstraintGroup[i]==1) left  += n;
++      else if (PotentialConstraintGroup[i]==2) right += n;
++    }
++    data[0]=left;
++    data[1]=right;
++  }
++  MPI_Bcast(data,2,MPI_DOUBLE,Host_ID,mpi_comm_level1);
++  *nl=data[0];
++  *nr=data[1];
++}
++
++void PotentialConstraint_Init(void)
++{
++  PotentialConstraintReferenceSet=0;
++  PotentialConstraintReferenceIter=-1;
++  PotentialConstraintNLeft=PotentialConstraintNRight=0.0;
++  PotentialConstraintNLeft0=PotentialConstraintNRight0=0.0;
++  PotentialConstraintQCurrent=0.0;
++}
++
++void PotentialConstraint_Update(int SCF_iter)
++{
++  int myid;
++  double dnleft,dnright;
++
++  MPI_Comm_rank(mpi_comm_level1,&myid);
++  electrode_populations(&PotentialConstraintNLeft,&PotentialConstraintNRight);
++  if (!PotentialConstraintReferenceSet) return;
++
++  dnleft  = PotentialConstraintNLeft  - PotentialConstraintNLeft0;
++  dnright = PotentialConstraintNRight - PotentialConstraintNRight0;
++  PotentialConstraintQCurrent=0.5*(-dnleft+dnright);
++
++  if (myid==Host_ID && PotentialConstraintOutput){
++    printf("Fixed Potential Difference: iter=%d Vc=%15.8f V Qcurrent=%15.8f dNleft=%15.8f dNright=%15.8f\n",
++           SCF_iter,PotentialConstraintVc,
++           PotentialConstraintQCurrent,dnleft,dnright);
++    fflush(stdout);
++  }
++}
++
++void PotentialConstraint_SetReference(int SCF_iter)
++{
++  int myid;
++  MPI_Comm_rank(mpi_comm_level1,&myid);
++  PotentialConstraintNLeft0=PotentialConstraintNLeft;
++  PotentialConstraintNRight0=PotentialConstraintNRight;
++  PotentialConstraintQCurrent=0.0;
++  PotentialConstraintReferenceSet=1;
++  PotentialConstraintReferenceIter=SCF_iter;
++  if (myid==Host_ID && PotentialConstraintOutput){
++    printf("Potential Constraint: unconstrained reference converged at iter=%d; Nleft0=%15.8f Nright0=%15.8f\n",
++           SCF_iter,PotentialConstraintNLeft0,PotentialConstraintNRight0);
++    fflush(stdout);
++  }
++}
++
++void PotentialConstraint_FinalOutput(void)
++{
++  int myid;
++  MPI_Comm_rank(mpi_comm_level1,&myid);
++  electrode_populations(&PotentialConstraintNLeft,&PotentialConstraintNRight);
++  if (PotentialConstraintReferenceSet){
++    PotentialConstraintQCurrent=0.5*(-(PotentialConstraintNLeft-PotentialConstraintNLeft0)
++                                  +(PotentialConstraintNRight-PotentialConstraintNRight0));
++  }
++  if (myid==Host_ID){
++    printf("\nFixed Potential-Difference Final Summary\n");
++    printf("Reference electrons: left=%15.8f right=%15.8f\n",PotentialConstraintNLeft0,PotentialConstraintNRight0);
++    printf("Current electrons:   left=%15.8f right=%15.8f\n",PotentialConstraintNLeft,PotentialConstraintNRight);
++    printf("Transferred charge:  %15.8f electron\n",PotentialConstraintQCurrent);
++    printf("Constraint difference Vc: %15.8f V\n\n",PotentialConstraintVc);
++    fflush(stdout);
++  }
++}
+diff --git a/source/Set_Hamiltonian.c b/source/Set_Hamiltonian.c
+index e00b740..0433b5e 100755
+--- a/source/Set_Hamiltonian.c
++++ b/source/Set_Hamiltonian.c
+@@ -161,9 +161,39 @@ double Set_Hamiltonian(char *mode,
+       }
+     }
+ 
+-  }
+-
+-  if(measure_time){ 
++  }
++
++  /***************************************************************
++    Two-group charge constraint.  A piecewise constant local
++    potential is represented in the non-orthogonal AO basis by
++                 1/2 (V_A + V_B) S_{A mu,B nu}.
++    PotentialConstraintVc is specified in eV; Hamiltonians use Hartree.
++  ***************************************************************/
++
++  if (PotentialConstraintDFT && PotentialConstraintReferenceSet){
++    for (Mc_AN=1; Mc_AN<=Matomnum; Mc_AN++){
++      double vA,vB,dv;
++      Gc_AN = M2G[Mc_AN];
++      Cwan = WhatSpecies[Gc_AN];
++      vA = (PotentialConstraintGroup[Gc_AN]==1 ?  0.5*PotentialConstraintVc :
++            PotentialConstraintGroup[Gc_AN]==2 ? -0.5*PotentialConstraintVc : 0.0);
++      for (h_AN=0; h_AN<=FNAN[Gc_AN]; h_AN++){
++        Gh_AN = natn[Gc_AN][h_AN];
++        Hwan = WhatSpecies[Gh_AN];
++        vB = (PotentialConstraintGroup[Gh_AN]==1 ?  0.5*PotentialConstraintVc :
++              PotentialConstraintGroup[Gh_AN]==2 ? -0.5*PotentialConstraintVc : 0.0);
++        dv = 0.5*(vA+vB)/eV2Hartree;
++        for (i=0; i<Spe_Total_NO[Cwan]; i++){
++          for (j=0; j<Spe_Total_NO[Hwan]; j++){
++            H[0][Mc_AN][h_AN][i][j] += dv*OLP[0][Mc_AN][h_AN][i][j];
++            if (SpinP_switch!=0) H[1][Mc_AN][h_AN][i][j] += dv*OLP[0][Mc_AN][h_AN][i][j];
++          }
++        }
++      }
++    }
++  }
++
++  if(measure_time){ 
+     dtime(&time2);
+     printf("myid=%4d Time1=%18.10f\n",myid,time2-time1);fflush(stdout);
+   }
+diff --git a/source/makefile b/source/makefile
+index 5db4d67..1b2494b 100755
+--- a/source/makefile
++++ b/source/makefile
+@@ -118,7 +118,7 @@ OBJS    = openmx.o openmx_common.o Input_std.o Inputtools.o init.o LU_inverse.o
+           Unfolding_Bands.o Band_DFT_Dosout.o Set_Density_Grid.o Set_Orbitals_Grid.o Set_Aden_Grid.o \
+           Gauss_Legendre.o zero_cfrac.o xyz2spherical.o AngularF.o RadialF.o Dr_RadialF.o PhiF.o \
+           VNAF.o Dr_VNAF.o VH_AtomF.o Dr_VH_AtomF.o RF_BesselF.o QuickSort.o Nonlocal_RadialF.o \
+-          KumoF.o Dr_KumoF.o Mulliken_Charge.o Occupation_Number_LDA_U.o Eff_Hub_Pot.o Coulomb_Interaction.o \
++          KumoF.o Dr_KumoF.o Mulliken_Charge.o Potential_Constraint.o Occupation_Number_LDA_U.o Eff_Hub_Pot.o Coulomb_Interaction.o \
+           EulerAngle_Spin.o Smoothing_Func.o Orbital_Moment.o Pot_NeutralAtom.o Simple_Mixing_DM.o \
+           DIIS_Mixing_DM.o ADIIS_Mixing_DM.o GR_Pulay_DM.o Kerker_Mixing_Rhok.o DIIS_Mixing_Rhok.o \
+           Total_Energy.o Contract_Hamiltonian.o Contract_iHNL.o Cont_Matrix0.o Cont_Matrix1.o Cont_Matrix2.o \
+diff --git a/source/openmx_common.h b/source/openmx_common.h
+index 54544a3..b06f5ae 100755
+--- a/source/openmx_common.h
++++ b/source/openmx_common.h
+@@ -2632,7 +2632,16 @@ int Runtest_flag;
+ int Num_Mixing_pDM,level_stdout,level_fileout,HS_fileout;
+ int memoryusage_fileout,monitoring_memory_usage;  
+ int Pulay_SCF,Pulay_SCF_original,EveryPulay_SCF,SCF_Control_Temp;
+-int Cnt_switch,RCnt_switch,SICnt_switch,ACnt_switch,SCnt_switch;
++int Cnt_switch,RCnt_switch,SICnt_switch,ACnt_switch,SCnt_switch;
++
++/* charge-constrained DFT for two electrode groups */
++int PotentialConstraintDFT,PotentialConstraintOutput;
++int *PotentialConstraintGroup;
++int PotentialConstraintReferenceSet,PotentialConstraintReferenceIter;
++double PotentialConstraintVc;
++double PotentialConstraintNLeft,PotentialConstraintNRight;
++double PotentialConstraintNLeft0,PotentialConstraintNRight0;
++double PotentialConstraintQCurrent;
+ int E_Field_switch,Simple_InitCnt[10];
+ int MD_Opt_OK,orbitalOpt_SCF,orbitalOpt_MD,orbitalOpt_per_MDIter;
+ int orbitalOpt_History,orbitalOpt_StartPulay,OrbOpt_OptMethod;
+@@ -2845,7 +2854,11 @@ void Data_Grid_Copy_B2C_1(double *data_B, double *data_C);
+ void Data_Grid_Copy_B2C_2(double **data_B, double **data_C); 
+ void Density_Grid_Copy_B2D(double **Density_Grid_B0);
+ double Set_Initial_DM(double *****CDM, double *****H);
+-double Mulliken_Charge( char *mode );
++double Mulliken_Charge( char *mode );
++void PotentialConstraint_Init(void);
++void PotentialConstraint_Update(int SCF_iter);
++void PotentialConstraint_SetReference(int SCF_iter);
++void PotentialConstraint_FinalOutput(void);
+ double LNO(char *mode,
+            int SCF_iter,
+            double ****OLP0,

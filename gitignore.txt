@@ -1,0 +1,9 @@
+*.aux
+*.log
+*.out
+*.toc
+*.xbb
+*.cube
+*_rst/
+__pycache__/
+.DS_Store
